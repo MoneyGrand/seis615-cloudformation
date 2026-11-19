@@ -1,0 +1,344 @@
+AWSTemplateFormatVersion: 2010-09-09
+# CF-CHANGED: Restructured the lab templete; this network version
+# creates the Multi-AZ network from my "Elasticity and availability" assignment and functing cafe app.
+Description: >-
+  CF Network Template for the cafe app: a VPC with two public and two private subnets
+  in two Availability Zones, an internet gateway, and one NAT gateway per Availability Zone.
+  Exports the VPC and subnet IDs for the application stack (lab-application.yaml).
+
+# This template creates:
+#   VPC
+#   Internet Gateway
+#   Public Route Table
+#   Public Subnet
+#   CF-ADDED: second public subnet, two private subnets, two Elastic IPs,
+#             two NAT gateways and two private route tables
+
+######################
+# Parameters section
+######################
+
+# CF-ADDED: The lab template had no parameters (everything was hard-coded).
+# Adding parameters make the template reusable: a second copy can be deployed with
+# another name prefix or address range without editing the file.
+Parameters:
+
+  # CF-ADDED: Name prefix for every resource. "cf" marks resources created by CloudFormation.
+  EnvironmentName:
+    Description: Prefix for resource Name tags (lowercase letters, digits and hyphens).
+    Type: String
+    Default: cafe-cf
+    AllowedPattern: '^[a-z][a-z0-9-]*$'
+
+  # CF-ADDED: Address ranges from the assignment diagram, as parameters.
+  VpcCidr:
+    Description: CIDR block of the VPC.
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnet1Cidr:
+    Description: Public subnet in the first Availability Zone (load balancer, NAT gateway, bastion).
+    Type: String
+    Default: 10.0.0.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PublicSubnet2Cidr:
+    Description: Public subnet in the second Availability Zone (load balancer, NAT gateway).
+    Type: String
+    Default: 10.0.1.0/24
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnet1Cidr:
+    Description: Private subnet in the first Availability Zone (application servers, RDS).
+    Type: String
+    Default: 10.0.2.0/23
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+  PrivateSubnet2Cidr:
+    Description: Private subnet in the second Availability Zone (application servers, RDS standby).
+    Type: String
+    Default: 10.0.4.0/23
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$'
+
+######################
+# Resources section
+######################
+
+Resources:
+
+  ## VPC
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      # CF-CHANGED: CIDR comes from a parameter.
+      CidrBlock: !Ref VpcCidr
+      # CF-ADDED: Name tag so the resource is easy to find in the console.
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-vpc
+
+  ## Internet Gateway
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    # CF-ADDED: Name tag.
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-igw
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  ## Public Route Table
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      # CF-ADDED: Name tag.
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-public
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  ## Public Subnets
+
+  # CF-CHANGED: "PublicSubnet" renamed to "PublicSubnet1". The assignment needs a public
+  # subnet in each of two Availability Zones (Multi-AZ).
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      # CF-CHANGED: CIDR comes from a parameter.
+      CidrBlock: !Ref PublicSubnet1Cidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      # CF-ADDED: Instances launched here (the bastion) get a public IP automatically.
+      MapPublicIpOnLaunch: true
+      # CF-ADDED: Name tag.
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-1a
+
+  # CF-ADDED: Second public subnet in the second Availability Zone. The Application Load
+  # Balancer requires subnets in at least two Availability Zones.
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet2Cidr
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-public-1b
+
+  # CF-CHANGED: Renamed to match PublicSubnet1.
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # CF-ADDED: The second public subnet also uses the public route table.
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # CF-REMOVED: PublicSubnetNetworkAclAssociation. A new subnet is automatically associated
+  # with the VPC's default network ACL, so this block did nothing extra. My design uses
+  # security groups for access control and keeps the default ACL (allow all).
+
+  ## Private Subnets
+
+  # CF-ADDED: added private subnets for the application servers (Auto Scaling group) and RDS.
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1Cidr
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs
+          Ref: AWS::Region
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-1a
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2Cidr
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs
+          Ref: AWS::Region
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-private-1b
+
+  ## NAT Gateways
+
+  # CF-ADDED: One Elastic IP and one NAT gateway in each PUBLIC subnet. So, private instances
+  # can reach the internet (for package installs) through the NAT gateway in their own
+  # Availability Zone, so losing an AZ does not lose internet access for the other.
+  NatEIP1:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eip-nat-1a
+
+  NatEIP2:
+    Type: AWS::EC2::EIP
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-eip-nat-1b
+
+  NatGateway1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP1.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-1a
+
+  NatGateway2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEIP2.AllocationId
+      SubnetId: !Ref PublicSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-nat-1b
+
+  ## Private Route Tables
+
+  # CF-ADDED: One private route table per Availability Zone. Each sends 0.0.0.0/0 to the
+  # NAT gateway in the same AZ.
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-private-1a
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway1
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-rtb-private-1b
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway2
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+######################
+# Outputs section
+######################
+
+# CF-CHANGED: The lab exported only one subnet. The cafe app stack now needs
+# both public subnets (load balancer, bastion) and both private subnets (Auto Scaling
+# group, RDS).
+
+Outputs:
+
+  VPC:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPCID'
+
+  # CF-CHANGED: was "PublicSubnet" exported as "-SubnetID".
+  PublicSubnet1:
+    Description: Public subnet in the first Availability Zone
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet1ID'
+
+  # CF-ADDED
+  PublicSubnet2:
+    Description: Public subnet in the second Availability Zone
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PublicSubnet2ID'
+
+  # CF-ADDED
+  PrivateSubnet1:
+    Description: Private subnet in the first Availability Zone
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet1ID'
+
+  # CF-ADDED
+  PrivateSubnet2:
+    Description: Private subnet in the second Availability Zone
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet2ID'
+
+  # CF-ADDED: NAT gateway addresses, this is used to verify that each private subnet leaves
+  # through its own Availability Zone's NAT gateway.
+  NatGateway1PublicIP:
+    Description: Public IP of the NAT gateway in the first Availability Zone
+    Value: !Ref NatEIP1
+
+  NatGateway2PublicIP:
+    Description: Public IP of the NAT gateway in the second Availability Zone
+    Value: !Ref NatEIP2
